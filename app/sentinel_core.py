@@ -1,10 +1,38 @@
 """
-CloudSentinel-MCP | PS 9 Core Integrity Engine
+CloudSentinel-MCP | PS 9 Core Integrity Engine & Independent Checkpoint Verifier
+=============================================================================
+Security hardened with independent external checkpoint storage (outside SQLite DB)
+to protect against administrator database rewriting or tampering.
 """
 import json
 import hashlib
 import sqlite3
+import os
 from datetime import datetime, timezone, timedelta
+
+def get_external_checkpoint_path(db_file):
+    return db_file + ".checkpoints_anchor.json"
+
+def load_external_checkpoints(db_file):
+    path = get_external_checkpoint_path(db_file)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            return {int(k): v for k, v in data.items()}
+    except Exception:
+        return {}
+
+def save_external_checkpoint(db_file, window_id, checkpoint_data):
+    path = get_external_checkpoint_path(db_file)
+    checkpoints = load_external_checkpoints(db_file)
+    checkpoints[window_id] = checkpoint_data
+    try:
+        with open(path, "w") as f:
+            json.dump({str(k): v for k, v in checkpoints.items()}, f, indent=2)
+    except Exception as e:
+        print(f"Error saving external checkpoint: {e}")
 
 def verify_ledger_db(db_file):
     conn = sqlite3.connect(db_file)
@@ -13,9 +41,14 @@ def verify_ledger_db(db_file):
     c.execute("SELECT * FROM windows ORDER BY window_id ASC")
     windows = c.fetchall()
     
+    # Load checkpoints from both DB and independent external storage
     c.execute("SELECT * FROM checkpoints")
-    checkpoints = {row["window_id"]: dict(row) for row in c.fetchall()}
+    db_checkpoints = {row["window_id"]: dict(row) for row in c.fetchall()}
     conn.close()
+
+    external_checkpoints = load_external_checkpoints(db_file)
+    # Merge or prioritize external independent checkpoints
+    checkpoints = {**db_checkpoints, **external_checkpoints}
 
     if not windows:
         return {"valid": True, "status": "intact", "message": "No windows found.", "tampered_windows": [], "missing_windows": []}
@@ -26,7 +59,7 @@ def verify_ledger_db(db_file):
         "total_windows": len(windows),
         "tampered_windows": [],
         "missing_windows": [],
-        "message": "All windows verified successfully against checkpoints. Status: INTACT."
+        "message": "All windows verified successfully against independent checkpoints. Status: INTACT."
     }
 
     expected_id = windows[0]["window_id"]
@@ -64,11 +97,17 @@ def verify_ledger_db(db_file):
             is_tampered = True
             tamper_reason = f"Window #{w['window_id']} chain broken: previous_hash does not match Window #{windows[i-1]['window_id']} hash."
 
-        if w["anchored"] == 1 and w["window_id"] in checkpoints:
-            chk = checkpoints[w["window_id"]]
-            if chk["window_hash"] != w["window_hash"]:
+        # Verify against independent checkpoint if anchored
+        if w["anchored"] == 1 or w["window_id"] in checkpoints:
+            if w["window_id"] not in checkpoints:
                 is_tampered = True
-                tamper_reason = f"Window #{w['window_id']} checkpoint discrepancy: local hash does not match immutable checkpoint hash on test ledger."
+                tamper_reason = f"Window #{w['window_id']} missing independent checkpoint verification source."
+            else:
+                chk = checkpoints[w["window_id"]]
+                chk_hash = chk.get("window_hash")
+                if chk_hash != w["window_hash"]:
+                    is_tampered = True
+                    tamper_reason = f"Window #{w['window_id']} checkpoint discrepancy: local window hash does not match independently stored immutable checkpoint."
 
         if is_tampered:
             results["valid"] = False
@@ -77,7 +116,7 @@ def verify_ledger_db(db_file):
                 "window_id": w["window_id"],
                 "reason": tamper_reason,
                 "first_detection": detect_ts,
-                "anchor_timestamp": w["anchor_timestamp"]
+                "anchor_timestamp": w["anchor_timestamp"] if "anchor_timestamp" in w.keys() and w["anchor_timestamp"] else "N/A"
             })
 
     if results["missing_windows"]:

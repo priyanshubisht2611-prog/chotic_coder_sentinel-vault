@@ -5,7 +5,7 @@ Features:
   1. Structured security event collection (auth, web, app logs)
   2. Fixed 5-minute time-window grouping
   3. Canonical SHA-256 hash chaining across windows
-  4. Blockchain / Test Ledger checkpoint anchoring adapter
+  4. Blockchain / Test Ledger checkpoint anchoring adapter with independent external storage
   5. Independent verification detecting modified lines, deleted lines, and missing windows
   6. Original checkpoint timestamps vs. first detection timestamps
   7. Intact, Tampered, and Missing statuses
@@ -20,7 +20,8 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import ollama
+
+from sentinel_core import verify_ledger_db, save_external_checkpoint
 
 DB_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(DB_DIR, "sentinel_audit.db")
@@ -73,7 +74,7 @@ def init_db():
             window_hash         TEXT    NOT NULL,
             anchor_timestamp    TEXT    NOT NULL,
             tx_hash             TEXT    NOT NULL,
-            network             TEXT    DEFAULT 'testnet-ledger'
+            network             TEXT    DEFAULT 'testnet-ledger-v1'
         )
     """)
 
@@ -113,6 +114,15 @@ def init_db():
             VALUES (?, ?, ?, ?, ?, 1, ?, ?, 'intact')
         """, (start, end, events_hash, prev_hash, window_hash, "0xgenesis_tx_mock_12345", now.isoformat()))
         conn.commit()
+
+        # Save external checkpoint for genesis
+        save_external_checkpoint(DB_FILE, 1, {
+            "window_id": 1,
+            "window_hash": window_hash,
+            "anchor_timestamp": now.isoformat(),
+            "tx_hash": "0xgenesis_tx_mock_12345",
+            "network": "testnet-ledger-v1"
+        })
 
     conn.close()
 
@@ -224,6 +234,7 @@ async def list_windows():
 
 @app.post("/anchor")
 async def anchor_windows():
+    """Anchor unanchored windows on test ledger simulation and independent external storage."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT * FROM windows WHERE anchored = 0 ORDER BY window_id ASC")
@@ -243,6 +254,15 @@ async def anchor_windows():
             VALUES (?, ?, ?, ?, 'testnet-ledger-v1')
         """, (w["window_id"], w["window_hash"], anchor_ts, tx_hash))
         conn.commit()
+
+        # Save independently in external storage adapter
+        save_external_checkpoint(DB_FILE, w["window_id"], {
+            "window_id": w["window_id"],
+            "window_hash": w["window_hash"],
+            "anchor_timestamp": anchor_ts,
+            "tx_hash": tx_hash,
+            "network": "testnet-ledger-v1"
+        })
         
         anchored_results.append({"window_id": w["window_id"], "tx_hash": tx_hash, "anchor_timestamp": anchor_ts})
         
@@ -251,100 +271,7 @@ async def anchor_windows():
 
 @app.get("/verify")
 async def verify_system():
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM windows ORDER BY window_id ASC")
-    windows = c.fetchall()
-    
-    c.execute("SELECT * FROM checkpoints")
-    checkpoints = {row["window_id"]: dict(row) for row in c.fetchall()}
-    conn.close()
-
-    if not windows:
-        return {"valid": True, "status": "intact", "message": "No windows found.", "details": []}
-
-    results = {
-        "valid": True,
-        "status": "intact",
-        "total_windows": len(windows),
-        "tampered_windows": [],
-        "missing_windows": [],
-        "message": "All windows verified successfully against checkpoints. Status: INTACT."
-    }
-
-    # 1. Check for missing windows first (sequence gaps)
-    expected_id = windows[0]["window_id"]
-    for w in windows:
-        if w["window_id"] != expected_id:
-            while expected_id < w["window_id"]:
-                results["valid"] = False
-                results["missing_windows"].append(expected_id)
-                expected_id += 1
-        expected_id = w["window_id"] + 1
-
-    if results["missing_windows"]:
-        results["status"] = "missing"
-        results["valid"] = False
-        results["message"] = f"Integrity check failed: Missing windows detected: {results['missing_windows']}"
-        return results
-
-    # 2. Check hash chain & checkpoint integrity
-    for i in range(len(windows)):
-        w = windows[i]
-        
-        conn = get_conn()
-        cc = conn.cursor()
-        cc.execute("SELECT * FROM events WHERE timestamp >= ? AND timestamp < ? ORDER BY id ASC", (w["start_time"], w["end_time"]))
-        events = [dict(r) for r in cc.fetchall()]
-        conn.close()
-        
-        events_json = json.dumps(events, sort_keys=True)
-        recomputed_events_hash = hashlib.sha256(events_json.encode()).hexdigest()
-        
-        window_raw = f"{w['start_time']}:{w['end_time']}:{recomputed_events_hash}:{w['previous_hash']}"
-        recomputed_window_hash = hashlib.sha256(window_raw.encode()).hexdigest()
-
-        is_tampered = False
-        tamper_reason = ""
-
-        if recomputed_window_hash != w["window_hash"]:
-            is_tampered = True
-            tamper_reason = f"Window #{w['window_id']} hash mismatch: stored hash differs from recomputed hash (log lines modified or deleted)."
-
-        if i > 0 and w["previous_hash"] != windows[i - 1]["window_hash"]:
-            is_tampered = True
-            tamper_reason = f"Window #{w['window_id']} chain broken: previous_hash does not match Window #{windows[i-1]['window_id']} hash."
-
-        if w["anchored"] == 1 and w["window_id"] in checkpoints:
-            chk = checkpoints[w["window_id"]]
-            if chk["window_hash"] != w["window_hash"]:
-                is_tampered = True
-                tamper_reason = f"Window #{w['window_id']} checkpoint discrepancy: local hash does not match immutable checkpoint hash on test ledger."
-
-        if is_tampered:
-            results["valid"] = False
-            detect_ts = datetime.now(timezone.utc).isoformat()
-            
-            if w["status"] == "intact":
-                conn = get_conn()
-                cc = conn.cursor()
-                cc.execute("UPDATE windows SET status = 'tampered', first_detection = ? WHERE window_id = ?", (detect_ts, w["window_id"]))
-                conn.commit()
-                conn.close()
-
-            results["tampered_windows"].append({
-                "window_id": w["window_id"],
-                "reason": tamper_reason,
-                "first_detection": detect_ts,
-                "anchor_timestamp": w["anchor_timestamp"]
-            })
-
-    if results["tampered_windows"]:
-        results["status"] = "tampered"
-        results["valid"] = False
-        results["message"] = f"Integrity check failed: Tampered windows detected: {[t['window_id'] for t in results['tampered_windows']]}"
-
-    return results
+    return verify_ledger_db(DB_FILE)
 
 @app.post("/tamper-demo")
 async def tamper_demo(request: Request):
@@ -357,7 +284,7 @@ async def tamper_demo(request: Request):
     conn.commit()
     conn.close()
     
-    verification = await verify_system()
+    verification = verify_ledger_db(DB_FILE)
     return {"status": "tampered", "window_id": window_id, "verification": verification}
 
 @app.post("/delete-window-demo")
@@ -371,7 +298,7 @@ async def delete_window_demo(request: Request):
     conn.commit()
     conn.close()
     
-    verification = await verify_system()
+    verification = verify_ledger_db(DB_FILE)
     return {"status": "window_deleted", "window_id": window_id, "verification": verification}
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+{
+  "1": {
+    "window_id": 1,
+    "window_hash": "74e1894d859e931d2b6f120529f17a98e9775d4aee1ec66cfc6533688611daf6",
+    "anchor_timestamp": "2026-10-27T10:28:22.821615+00:00",
+    "tx_hash": "0xgenesis_tx_mock_12345",
+    "network": "testnet-ledger-v1"
+  },
+  "2": {
+    "window_id": 2,
+    "window_hash": "80ffc9c3a78ea449dad4b1512c92e721f03bab524c57e71bff71f2d3e07aa071",
+    "anchor_timestamp": "2026-10-27T10:28:22.839628+00:00",
+    "tx_hash": "0xchk_f389b12806d2ff464dac92c27db7cac4abdc70c594ebc3e39c9097ee8e62f36d",
+    "network": "testnet-ledger-v1"
+  }
+}
